@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>TransferFile Receiver</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #111; color: #eee; font-family: 'Segoe UI', sans-serif; min-height: 100vh; display: flex; flex-direction: column; align-items: center; }
+h1 { font-size: 1.2rem; padding: 12px; color: #0cf; letter-spacing: 1px; }
+
+#screens > div { display: none; flex-direction: column; align-items: center; padding: 8px; width: 100vw; }
+#screens > div.active { display: flex; }
+
+/* ── Screen 1: Camera + Calibration ── */
+#wrap { position: relative; width: 100%; max-width: 640px; }
+#video  { width: 100%; display: block; border-radius: 6px; }
+#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: crosshair; }
+.dot { position: absolute; width: 22px; height: 22px; border-radius: 50%; border: 3px solid #fff;
+       transform: translate(-50%,-50%); pointer-events: none; font-size: 10px; display: flex;
+       align-items: center; justify-content: center; font-weight: bold; color: #fff; }
+
+#calInfo { margin: 8px 0; font-size: .85rem; color: #aaa; text-align: center; max-width: 340px; }
+#calStep { font-size: 1rem; color: #ff0; padding: 6px 0; text-align: center; min-height: 28px; }
+#btnConfirm { margin-top: 8px; padding: 10px 32px; background: #0c8; border: none; border-radius: 6px;
+              color: #000; font-size: 1rem; cursor: pointer; display: none; }
+
+/* ── Screen 2: Receiving ── */
+#rcvCanvas { width: 100%; max-width: 640px; height: auto; display: none; }
+#progress { width: 90%; max-width: 500px; height: 18px; background: #333; border-radius: 9px;
+            overflow: hidden; margin: 10px 0; }
+#progressBar { height: 100%; width: 0; background: linear-gradient(90deg,#0cf,#09f); transition: width .3s; }
+#rcvStatus { font-size: .9rem; color: #ccc; text-align: center; }
+#rcvEta    { font-size: .85rem; color: #ff0; text-align: center; margin-top: 4px; }
+#missingBar { font-size: .75rem; color: #888; text-align: center; margin-top: 4px; }
+
+/* ── Screen 3: Done ── */
+#doneIcon { font-size: 3rem; margin: 20px 0 8px; }
+#doneMsg  { font-size: 1rem; color: #ccc; text-align: center; margin-bottom: 16px; }
+#btnDownload { padding: 12px 40px; background: #0cf; border: none; border-radius: 8px;
+               color: #000; font-size: 1.1rem; font-weight: bold; cursor: pointer; }
+#btnRestart { margin-top: 14px; background: none; border: 1px solid #555; color: #aaa;
+              padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>TransferFile — Receiver</h1>
+
+<div id="screens">
+  <!-- Screen 1: Calibration -->
+  <div id="s1" class="active">
+    <div id="wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <p id="calInfo">Trỏ camera vào màn hình PC đang hiển thị khung hiệu chỉnh (ô cờ vua màu sắc).<br>
+      Nhấn lần lượt vào <b>4 góc</b> của lưới (góc ngoài cùng của ô màu).</p>
+    <p id="calStep">Nhấn vào góc Trên-Trái (ô ĐỎ)</p>
+    <button id="btnConfirm" onclick="startReceiving()">▶ Bắt đầu nhận</button>
+  </div>
+
+  <!-- Screen 2: Receiving -->
+  <div id="s2">
+    <canvas id="rcvCanvas"></canvas>
+    <div id="progress"><div id="progressBar"></div></div>
+    <p id="rcvStatus">Đang chuẩn bị…</p>
+    <p id="rcvEta"></p>
+    <p id="missingBar"></p>
+  </div>
+
+  <!-- Screen 3: Done -->
+  <div id="s3">
+    <div id="doneIcon">✅</div>
+    <p id="doneMsg"></p>
+    <button id="btnDownload">⬇ Tải file</button>
+    <button id="btnRestart" onclick="location.reload()">Nhận file khác</button>
+  </div>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════
+//  PROTOCOL CONSTANTS  (must match Protocol.java)
+// ══════════════════════════════════════════════════════
+const COLS              = 64;
+const ROWS              = 64;
+const SYNC_ROW          = 0;
+const HEADER_ROW_START  = 1;
+const HEADER_ROWS       = 3;
+const DATA_ROW_START    = 4;
+const DATA_ROWS         = ROWS - DATA_ROW_START;      // 60
+const BITS_PER_BLOCK    = 3;
+const HEADER_BYTES      = (HEADER_ROWS * COLS * BITS_PER_BLOCK) / 8;      // 72
+const DATA_BYTES        = (DATA_ROWS  * COLS * BITS_PER_BLOCK) / 8;       // 1440
+
+// Palette RGB  (must match Protocol.java COLOR_RGB)
+const PALETTE = [
+  [0,0,0],       // 0 Black
+  [255,255,255], // 1 White
+  [255,0,0],     // 2 Red
+  [0,204,0],     // 3 Green
+  [0,0,255],     // 4 Blue
+  [255,255,0],   // 5 Yellow
+  [0,255,255],   // 6 Cyan
+  [255,0,255],   // 7 Magenta
+];
+
+// ══════════════════════════════════════════════════════
+//  GLOBALS
+// ══════════════════════════════════════════════════════
+const video    = document.getElementById('video');
+const overlay  = document.getElementById('overlay');
+const olvCtx   = overlay.getContext('2d');
+
+let corners    = [];   // [{x,y}, ...] up to 4
+let stream     = null;
+let decodeLoop = null;
+
+let totalFrames  = 0;
+let fileSize     = 0;
+let fileCRC      = 0;
+let filename     = '';
+let receivedFrames = new Map();  // frameIndex -> Uint8Array(dataLen)
+let startRcvTime = 0;
+let downloadBlob = null;
+
+// Off-screen canvas for decoding
+const decCanvas = document.createElement('canvas');
+const decCtx    = decCanvas.getContext('2d', { willReadFrequently: true });
+
+// ══════════════════════════════════════════════════════
+//  STARTUP: request camera
+// ══════════════════════════════════════════════════════
+(async function init() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+    // size overlay to match video
+    video.addEventListener('loadedmetadata', () => {
+      overlay.width  = video.videoWidth;
+      overlay.height = video.videoHeight;
+      overlay.style.width  = video.offsetWidth  + 'px';
+      overlay.style.height = video.offsetHeight + 'px';
+    });
+  } catch (e) {
+    alert('Không truy cập được camera: ' + e.message);
+  }
+})();
+
+// Resize overlay when video resizes
+new ResizeObserver(() => {
+  if (video.videoWidth) {
+    overlay.style.width  = video.offsetWidth  + 'px';
+    overlay.style.height = video.offsetHeight + 'px';
+  }
+}).observe(video);
+
+// ══════════════════════════════════════════════════════
+//  CALIBRATION: corner clicks
+// ══════════════════════════════════════════════════════
+const CORNER_LABELS = [
+  { text: '1', color: '#f44' },  // TL Red
+  { text: '2', color: '#4f4' },  // TR Green
+  { text: '3', color: '#44f' },  // BL Blue
+  { text: '4', color: '#ff4' },  // BR Yellow
+];
+const CORNER_STEPS = [
+  'Nhấn vào góc Trên-Trái (ô ĐỎ)',
+  'Nhấn vào góc Trên-Phải (ô XANH LÁ)',
+  'Nhấn vào góc Dưới-Trái (ô XANH DƯƠNG)',
+  'Nhấn vào góc Dưới-Phải (ô VÀNG)',
+];
+
+overlay.addEventListener('click', e => {
+  if (corners.length >= 4) return;
+  const rect   = overlay.getBoundingClientRect();
+  const scaleX = overlay.width  / rect.width;
+  const scaleY = overlay.height / rect.height;
+  const cx = (e.clientX - rect.left) * scaleX;
+  const cy = (e.clientY - rect.top)  * scaleY;
+  corners.push({ x: cx, y: cy });
+  drawCornerMarker(e.clientX - rect.left, e.clientY - rect.top, corners.length - 1);
+
+  if (corners.length < 4) {
+    document.getElementById('calStep').textContent = CORNER_STEPS[corners.length];
+  } else {
+    document.getElementById('calStep').textContent = '✔ Đã chọn đủ 4 góc';
+    document.getElementById('btnConfirm').style.display = 'inline-block';
+    drawGridOverlay();
+  }
+});
+
+function drawCornerMarker(px, py, idx) {
+  const dot      = document.createElement('div');
+  dot.className  = 'dot';
+  dot.textContent = CORNER_LABELS[idx].text;
+  dot.style.left  = px + 'px';
+  dot.style.top   = py + 'px';
+  dot.style.background = CORNER_LABELS[idx].color;
+  document.getElementById('wrap').appendChild(dot);
+}
+
+function drawGridOverlay() {
+  // Draw the detected grid outline on overlay canvas
+  olvCtx.clearRect(0, 0, overlay.width, overlay.height);
+  olvCtx.strokeStyle = '#0ff';
+  olvCtx.lineWidth   = 2;
+  olvCtx.beginPath();
+  const [tl, tr, bl, br] = corners;
+  olvCtx.moveTo(tl.x, tl.y);
+  olvCtx.lineTo(tr.x, tr.y);
+  olvCtx.lineTo(br.x, br.y);
+  olvCtx.lineTo(bl.x, bl.y);
+  olvCtx.closePath();
+  olvCtx.stroke();
+}
+
+// ══════════════════════════════════════════════════════
+//  PERSPECTIVE (bilinear quad interpolation)
+// ══════════════════════════════════════════════════════
+function gridToCamera(u, v) {
+  // u,v in [0,1] — TL=corners[0], TR=corners[1], BL=corners[2], BR=corners[3]
+  const [tl, tr, bl, br] = corners;
+  const x = tl.x*(1-u)*(1-v) + tr.x*u*(1-v) + bl.x*(1-u)*v + br.x*u*v;
+  const y = tl.y*(1-u)*(1-v) + tr.y*u*(1-v) + bl.y*(1-u)*v + br.y*u*v;
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
+// ══════════════════════════════════════════════════════
+//  COLOR CLASSIFICATION (HSV-based, camera-robust)
+// ══════════════════════════════════════════════════════
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r,g,b), min = Math.min(r,g,b), d = max - min;
+  const s = max === 0 ? 0 : d / max;
+  const v = max;
+  let h = 0;
+  if (d > 0) {
+    switch (max) {
+      case r: h = ((g-b)/d + (g<b?6:0)) / 6; break;
+      case g: h = ((b-r)/d + 2)           / 6; break;
+      case b: h = ((r-g)/d + 4)           / 6; break;
+    }
+  }
+  return { h: h*360, s, v };
+}
+
+function classifyColor(r, g, b) {
+  const { h, s, v } = rgbToHsv(r, g, b);
+  if (v < 0.25)            return 0;  // Black
+  if (v > 0.75 && s < 0.25) return 1; // White
+  if (s < 0.30)            return v > 0.5 ? 1 : 0;  // near-gray
+  // hue sectors (each ±30° wide)
+  if (h < 30 || h >= 330)  return 2;  // Red
+  if (h < 90)              return 5;  // Yellow
+  if (h < 150)             return 3;  // Green
+  if (h < 210)             return 6;  // Cyan
+  if (h < 270)             return 4;  // Blue
+  return 7;                            // Magenta
+}
+
+// ══════════════════════════════════════════════════════
+//  SAMPLE A SINGLE BLOCK  (3×3 pixel average)
+// ══════════════════════════════════════════════════════
+function sampleBlock(imgData, row, col) {
+  const u  = (col + 0.5) / COLS;
+  const v  = (row + 0.5) / ROWS;
+  const {x, y} = gridToCamera(u, v);
+  const W  = imgData.width, H = imgData.height;
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const px = x+dx, py = y+dy;
+      if (px >= 0 && px < W && py >= 0 && py < H) {
+        const i = (py*W + px)*4;
+        r += imgData.data[i]; g += imgData.data[i+1]; b += imgData.data[i+2]; n++;
+      }
+    }
+  }
+  return classifyColor(r/n, g/n, b/n);
+}
+
+// ══════════════════════════════════════════════════════
+//  BIT EXTRACTION / BYTE RECONSTRUCTION
+// ══════════════════════════════════════════════════════
+function blocksToBytes(colorVals, byteCount) {
+  const out  = new Uint8Array(byteCount);
+  let buf = 0, bits = 0, idx = 0;
+  for (const cv of colorVals) {
+    buf = (buf << 3) | (cv & 7);
+    bits += 3;
+    while (bits >= 8 && idx < byteCount) {
+      bits -= 8;
+      out[idx++] = (buf >> bits) & 0xff;
+    }
+  }
+  return out;
+}
+
+// ══════════════════════════════════════════════════════
+//  CRC32 (matches java.util.zip.CRC32 — IEEE 802.3)
+// ══════════════════════════════════════════════════════
+const CRC_TBL = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c;
+  }
+  return t;
+})();
+
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++)
+    c = (c >>> 8) ^ CRC_TBL[(c ^ bytes[i]) & 0xFF];
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// ══════════════════════════════════════════════════════
+//  FRAME DECODING
+// ══════════════════════════════════════════════════════
+let lastFrameIndex = -1;
+
+function decodeOneFrame() {
+  if (!video.videoWidth) return;
+
+  const W = video.videoWidth, H = video.videoHeight;
+  decCanvas.width = W; decCanvas.height = H;
+  decCtx.drawImage(video, 0, 0, W, H);
+  const imgData = decCtx.getImageData(0, 0, W, H);
+
+  // 1. Check sync row: must be alternating 0,1,0,1,...
+  let syncOk = true;
+  for (let c = 0; c < COLS; c++) {
+    const v = sampleBlock(imgData, SYNC_ROW, c);
+    if (v !== c % 2) { syncOk = false; break; }
+  }
+  if (!syncOk) return;
+
+  // 2. Decode header
+  const hdrBlocks = [];
+  for (let r = HEADER_ROW_START; r < HEADER_ROW_START + HEADER_ROWS; r++)
+    for (let c = 0; c < COLS; c++)
+      hdrBlocks.push(sampleBlock(imgData, r, c));
+  const hdrBytes = blocksToBytes(hdrBlocks, HEADER_BYTES);
+
+  const view        = new DataView(hdrBytes.buffer);
+  const frameIndex  = view.getInt32(0);
+  const frameTot    = view.getInt32(4);
+  const fSize       = Number(view.getBigInt64(8));
+  const frameCRCexp = view.getUint32(16) >>> 0;
+  const fileCRCexp  = view.getUint32(20) >>> 0;
+  const nameLen     = hdrBytes[24];
+  const fname       = new TextDecoder().decode(hdrBytes.slice(25, 25 + nameLen));
+  const dataLen     = view.getInt32(57);
+
+  if (frameIndex < 0 || frameTot <= 0 || dataLen <= 0 || dataLen > DATA_BYTES) return;
+  if (receivedFrames.has(frameIndex)) return;  // already got this one
+  if (frameIndex === lastFrameIndex) return;
+  lastFrameIndex = frameIndex;
+
+  // 3. Decode data rows
+  const dataBlocks = [];
+  for (let r = DATA_ROW_START; r < ROWS; r++)
+    for (let c = 0; c < COLS; c++)
+      dataBlocks.push(sampleBlock(imgData, r, c));
+  const dataBytes = blocksToBytes(dataBlocks, DATA_BYTES);
+
+  // 4. Verify CRC
+  const computedCRC = crc32(dataBytes.subarray(0, dataLen));
+  if (computedCRC !== frameCRCexp) return;
+
+  // 5. Store frame
+  if (totalFrames === 0) {
+    totalFrames = frameTot;
+    fileSize    = fSize;
+    fileCRC     = fileCRCexp;
+    filename    = fname || 'received_file';
+    startRcvTime = Date.now();
+  }
+
+  receivedFrames.set(frameIndex, { data: dataBytes, dataLen });
+  updateProgress();
+
+  if (receivedFrames.size === totalFrames) {
+    clearInterval(decodeLoop);
+    reconstructFile();
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  PROGRESS UI
+// ══════════════════════════════════════════════════════
+function updateProgress() {
+  const got  = receivedFrames.size;
+  const pct  = totalFrames > 0 ? (got / totalFrames * 100).toFixed(1) : 0;
+  document.getElementById('progressBar').style.width = pct + '%';
+  document.getElementById('rcvStatus').textContent =
+    `Đã nhận: ${got} / ${totalFrames} frame (${pct}%)`;
+
+  if (got > 1) {
+    const elapsed  = (Date.now() - startRcvTime) / 1000;
+    const rate     = got / elapsed;
+    const remaining = (totalFrames - got) / rate;
+    const etaTxt   = remaining < 60
+      ? `còn ~${remaining.toFixed(0)} giây`
+      : `còn ~${(remaining/60).toFixed(1)} phút`;
+    document.getElementById('rcvEta').textContent = etaTxt;
+  }
+
+  // Show missing frame count
+  const missing = totalFrames - got;
+  document.getElementById('missingBar').textContent =
+    missing > 0 ? `Còn thiếu ${missing} frame — sender đang lặp lại…` : '';
+}
+
+// ══════════════════════════════════════════════════════
+//  FILE RECONSTRUCTION + DOWNLOAD
+// ══════════════════════════════════════════════════════
+function reconstructFile() {
+  const all = new Uint8Array(fileSize);
+  let offset = 0;
+  for (let i = 0; i < totalFrames; i++) {
+    const f = receivedFrames.get(i);
+    all.set(f.data.subarray(0, f.dataLen), offset);
+    offset += f.dataLen;
+  }
+
+  const computedFileCRC = crc32(all);
+  const ok = computedFileCRC === fileCRC;
+
+  downloadBlob = new Blob([all]);
+
+  showScreen('s3');
+  document.getElementById('doneIcon').textContent = ok ? '✅' : '⚠️';
+  document.getElementById('doneMsg').textContent  = ok
+    ? `${filename}  (${(fileSize/1048576).toFixed(2)} MB) — CRC ✔`
+    : `${filename}  — CRC không khớp, file có thể bị lỗi`;
+
+  document.getElementById('btnDownload').onclick = () => {
+    const a   = document.createElement('a');
+    a.href     = URL.createObjectURL(downloadBlob);
+    a.download = filename;
+    a.click();
+  };
+}
+
+// ══════════════════════════════════════════════════════
+//  START RECEIVING (called after calibration)
+// ══════════════════════════════════════════════════════
+function startReceiving() {
+  showScreen('s2');
+  // decode loop: every 60ms (~16fps, safe for 30fps camera)
+  decodeLoop = setInterval(decodeOneFrame, 60);
+}
+
+// ══════════════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════════════
+function showScreen(id) {
+  document.querySelectorAll('#screens > div').forEach(d => d.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+</script>
+</body>
+</html>
